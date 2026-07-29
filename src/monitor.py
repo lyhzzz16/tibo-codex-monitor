@@ -6,25 +6,18 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 
-SOURCE_URL = "https://mobile.twstalker.com/thsottiaux"
+SOURCE_URL = "https://fxtwitter.com/thsottiaux/feed.xml?count=50"
 ACCOUNT_URL = "https://x.com/thsottiaux"
 STATE_PATH = Path("state/seen.json")
 
-TIME_RE = re.compile(
-    r"^(?:\d+\s+(?:second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago|"
-    r"(?:just now|yesterday))$",
-    re.IGNORECASE,
-)
-AUTHOR_RE = re.compile(r"^Tibo\s+@thsottiaux$", re.IGNORECASE)
-
 KEYWORDS = (
-    "reset",
     "usage limit",
     "usage limits",
     "rate limit",
@@ -54,57 +47,31 @@ def fetch_page() -> str:
         SOURCE_URL,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; TiboCodexMonitor/1.0)",
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     )
     with urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
-def visible_lines(page: str) -> list[str]:
-    # The mirror is server-rendered. This deliberately uses a small, dependency-free
-    # parser so the scheduled job does not need a third-party Python package.
-    page = re.sub(r"<script\b[^>]*>.*?</script>", " ", page, flags=re.I | re.S)
-    page = re.sub(r"<style\b[^>]*>.*?</style>", " ", page, flags=re.I | re.S)
-    page = re.sub(r"<br\s*/?>", "\n", page, flags=re.I)
-    page = re.sub(r"</(?:p|div|li|article|section|h[1-6])\s*>", "\n", page, flags=re.I)
-    page = re.sub(r"<[^>]+>", " ", page)
-    page = html.unescape(page).replace("\r", "")
-    lines = []
-    for line in page.split("\n"):
-        line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            lines.append(line)
-    return lines
-
-
 def extract_posts(page: str) -> list[Post]:
-    lines = visible_lines(page)
-    starts = [i for i, line in enumerate(lines) if AUTHOR_RE.match(line)]
+    root = ElementTree.fromstring(page)
     posts: list[Post] = []
-    for position, start in enumerate(starts):
-        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        block = lines[start + 1 : end]
-        time_index = next((i for i, line in enumerate(block) if TIME_RE.match(line)), None)
-        if time_index is None:
-            continue
-        published = block[time_index]
-        body: list[str] = []
-        for line in block[time_index + 1 :]:
-            if line.lower() in {"view details", "load more"}:
-                break
-            # Engagement counts are exposed as one number per line by the mirror.
-            if body and re.fullmatch(r"[\d,.]+[KMB]?", line, re.IGNORECASE):
-                continue
-            if line.startswith("@"):  # Keep the post body, but omit reply handles.
-                continue
-            body.append(line)
-        text = " ".join(body).strip()
+    for item in root.findall("./channel/item"):
+        description = item.findtext("description", default="")
+        # Ignore an embedded quoted post so it cannot create a false keyword match.
+        description = re.split(r"<blockquote\b", description, maxsplit=1, flags=re.I)[0]
+        description = re.sub(r"<br\s*/?>", "\n", description, flags=re.I)
+        description = re.sub(r"<[^>]+>", " ", description)
+        text = re.sub(r"\s+", " ", html.unescape(description)).strip()
         if not text:
             continue
-        fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        posts.append(Post(text=text, published=published, url=ACCOUNT_URL, fingerprint=fingerprint))
-    # Preserve page order while removing duplicate mirror blocks.
+        url = (item.findtext("link", default=ACCOUNT_URL) or ACCOUNT_URL).strip()
+        published = (item.findtext("pubDate", default="unknown time") or "unknown time").strip()
+        fingerprint = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        posts.append(Post(text=text, published=published, url=url, fingerprint=fingerprint))
+
+    # Preserve feed order while removing duplicates.
     unique: dict[str, Post] = {}
     for post in posts:
         unique.setdefault(post.fingerprint, post)
@@ -139,8 +106,11 @@ def send_wecom(posts: list[Post]) -> None:
     if not webhook:
         raise RuntimeError("WECOM_WEBHOOK_URL is not configured")
     lines = ["**Tibo 有新的 Codex 使用限制/重置相关动态**", ""]
-    for post in posts:
-        lines.extend([f"- {post.published}：{post.text}", f"  [查看账号]({post.url})", ""])
+    for post in posts[:3]:
+        text = post.text if len(post.text) <= 900 else post.text[:897] + "..."
+        lines.extend([f"- {post.published}：{text}", f"  [查看原帖]({post.url})", ""])
+    if len(posts) > 3:
+        lines.append(f"另有 {len(posts) - 3} 条匹配动态，请打开账号查看。")
     payload = json.dumps({"msgtype": "markdown", "markdown": {"content": "\n".join(lines)}}).encode("utf-8")
     request = Request(webhook, data=payload, method="POST", headers={"Content-Type": "application/json"})
     with urlopen(request, timeout=30) as response:
@@ -153,7 +123,7 @@ def main() -> int:
     try:
         page = fetch_page()
         posts = extract_posts(page)
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+    except (HTTPError, URLError, TimeoutError, OSError, ElementTree.ParseError) as exc:
         print(f"Source fetch failed: {exc}", file=sys.stderr)
         return 1
 
